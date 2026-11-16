@@ -3,7 +3,7 @@
 原始项目：https://github.com/Cai-aa/CAD-Agent-Hub
 原始版权：Copyright (c) 2026 Cai-aa
 
-本仓库包含对原始项目的修改与功能补丁，修改内容见提交记录。
+本仓库包含对原始项目的修改与功能补丁，修改内容见提交记录。由维护者新增的修改与文档，同样按 MIT 许可证提供。
 
 许可证：本项目沿用 MIT 许可证，全文见 LICENSE 文件。CATIA 段与 HyperMesh 段各自的版权与许可声明见对应目录下的 LICENSE 与 NOTICE。原始版权声明与许可声明必须保留在所有副本或实质性部分中。再分发本项目或基于本项目的衍生作品时，须同时保留 LICENSE 与本说明文件。
 
@@ -14,6 +14,6 @@ This repository is a modified version of Cai-aa/CAD-Agent-Hub and is released pu
 Original project: https://github.com/Cai-aa/CAD-Agent-Hub
 Original copyright: Copyright (c) 2026 Cai-aa
 
-This repository contains modifications and patches to the original project; see the commit history for details.
+This repository contains modifications and patches to the original project; see the commit history for details. Modifications and documentation added by the repository maintainer are also provided under the MIT License.
 
 License: This project is distributed under the MIT License; see LICENSE for the full text. The CATIA and HyperMesh segments carry their own copyright and license notices in their respective directories. The original copyright notice and this permission notice shall be included in all copies or substantial portions of the Software. Redistributions and derivative works must retain both LICENSE and this NOTICE.
