@@ -131,6 +131,8 @@ def test_general_mode_runs_the_fixed_steps_and_groups_from_the_table(tmp_path):
     meshes = bridge.calls_named("automesh_surfaces")
     assert len(meshes) == 1
     assert meshes[0]["surface_ids"] == [1, 2]
+    assert meshes[0]["density_mode"] == "proximity_curvature"
+    assert meshes[0]["mesh_algorithm"] == "free"
     # One component per distinct pair, and the elements moved by surface.
     assert sorted(group["name"] for group in result["groups"]) == ["A-B", "A-air"]
     organised = {tuple(item["surface_ids"]): item for item in bridge.calls_named("organize_elements")}
@@ -157,6 +159,14 @@ def test_surfaces_removed_as_duplicates_leave_the_mesh_plan(tmp_path):
     drop = [params for params in bridge.calls_named("delete_entities")
             if params["entity_type"] == "surface"][0]
     assert drop["entity_ids"] == [3]
+
+
+def test_density_mode_alias_and_mesh_algorithm_validation():
+    config = make_config(wf.GENERAL, mesh_type="curvature")
+    assert config.density_mode == "curvature"
+    assert config.mesh_type == "curvature"
+    with pytest.raises(ValueError, match="Mapped"):
+        make_config(wf.GENERAL, mesh_algorithm="mapped")
 
 
 def test_general_mode_without_a_pair_table_fails_before_meshing(tmp_path):
@@ -200,6 +210,79 @@ def test_verification_meshes_every_shell_surface_then_rebuilds_from_scratch(tmp_
     table = json.loads((tmp_path / "out.pairs.json").read_text(encoding="utf-8"))
     assert table["1"]["pair"] == "A-air"
     assert table["2"]["pair"] == "A-B"
+
+
+def test_reference_mesh_can_use_a_coarse_size(tmp_path, monkeypatch):
+    monkeypatch.setattr(wf, "classify", fake_classifier(
+        lambda surface: ("A", "air") if surface == 1 else ("A", "B")))
+    bridge = FakeBridge([1, 2, 3])
+    config = make_config(
+        wf.VERIFICATION, element_size=5.0, reference_element_size=20.0
+    )
+
+    wf.run(bridge, config, tmp_path)
+
+    meshes = bridge.calls_named("automesh_surfaces")
+    assert [item["element_size"] for item in meshes[:3]] == [20.0, 20.0, 20.0]
+    assert [item["element_size"] for item in meshes[3:]] == [5.0]
+
+
+def test_resume_produces_without_importing_or_reference_meshing(tmp_path):
+    write_pairs(tmp_path, {
+        "1": {"pair": "A-air", "minus": "A", "plus": "air"},
+        "2": {"pair": "A-B", "minus": "A", "plus": "B"},
+        "3": {"pair": "A-air", "minus": "A", "plus": "air"},
+    })
+    bridge = FakeBridge([1, 2, 3])
+    imported = {
+        "surface_ids": [1, 2, 3],
+        "solid_ids": [41, 42],
+        "component_ids": [1],
+    }
+
+    result = wf.run(
+        bridge,
+        make_config(wf.VERIFICATION),
+        tmp_path,
+        resume={"imported": imported},
+    )
+
+    assert bridge.import_count == 0
+    assert [step["step"] for step in result["steps"]] == [
+        "drop_solids",
+        "duplicates",
+        "drop_surfaces",
+        "stitch",
+        "mesh",
+        "pairs",
+        "groups",
+        "export",
+    ]
+    meshes = bridge.calls_named("automesh_surfaces")
+    assert len(meshes) == 1
+    assert meshes[0]["surface_ids"] == [1, 2]
+    assert result["import"] == imported
+    assert result["resumed"] is True
+
+
+def test_resume_refuses_while_reference_elements_remain(tmp_path):
+    write_pairs(tmp_path, {
+        "1": {"pair": "A-air", "minus": "A", "plus": "air"},
+    })
+    bridge = FakeBridge(
+        [1, 2, 3], model_counts={"surface": 3, "element": 4}
+    )
+
+    with pytest.raises(wf.WorkflowError) as error:
+        wf.run(
+            bridge,
+            make_config(wf.VERIFICATION),
+            tmp_path,
+            resume={"imported": {"surface_ids": [1, 2, 3]}},
+        )
+
+    assert "reference mesh" in str(error.value)
+    assert bridge.calls_named("remove_duplicate_surfaces") == []
 
 
 def test_missing_export_template_names_the_failing_step(tmp_path):
@@ -247,6 +330,29 @@ def test_same_medium_surfaces_are_reported_not_grouped(tmp_path, monkeypatch):
     assert result["same_medium"] == [{"surface": 1, "pair": "air-air"}]
     assert [group["name"] for group in result["groups"]] == ["A-B"]
     assert bridge.calls_named("organize_elements")[0]["surface_ids"] == [2]
+
+
+def test_same_medium_with_a_face_tag_is_grouped(tmp_path, monkeypatch):
+    # An ideal-conductor sheet can sit inside one medium: air on both sides,
+    # PEC on the face.  It is a boundary, not a same-medium exclusion.
+    monkeypatch.setattr(wf, "classify", fake_classifier(
+        lambda surface: (("air", "air") if surface == 1 else ("A", "B")))
+    )
+    bridge = FakeBridge([1, 2, 3])
+
+    result = wf.run(
+        bridge,
+        make_config(wf.VERIFICATION, face_tags={1: ["PEC"]}),
+        tmp_path,
+    )
+
+    assert result["same_medium"] == []
+    assert [group["name"] for group in result["groups"]] == [
+        "A-B",
+        "air-air-PEC",
+    ]
+    moves = bridge.calls_named("organize_elements")
+    assert sorted(item["surface_ids"] for item in moves) == [[1], [2]]
 
 
 def test_face_tags_reach_the_pair_table(tmp_path, monkeypatch):

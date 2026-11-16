@@ -10,7 +10,7 @@ jobs, and talks to an authenticated in-application extension for live geometry
 and meshing. Model-changing live operations are typed and checkpointed.
 Arbitrary Python, Tcl, and shell execution is not exposed.
 
-Current versions: Python package `0.13.0`, in-application extension `0.28.0`.
+Current versions: Python package `0.13.0`, in-application extension `0.29.0`.
 
 ## What you can do
 
@@ -19,7 +19,8 @@ Current versions: Python package `0.13.0`, in-application extension `0.28.0`.
   roll back to checkpoints.
 - Export a grouped `.fhm` mesh for FEKO. Material pairs are decided from closed
   material shells and winding numbers, not from distance thresholds.
-- Run the complete CATIA → HyperMesh → FEKO workflow with one preset.
+- Run the staged CATIA → HyperMesh → FEKO workflow, which asks the operator
+  about the material pairs before any surface is removed.
 - Build typed OptiStruct and Radioss models, submit jobs, and read the real
   status, logs, and artifacts.
 - Post-process results in HyperView and HyperGraph: contours, queries, PNG
@@ -86,10 +87,16 @@ thread.
 
 ## Quick start: CATIA → HyperMesh → FEKO
 
-The preset `run_catia_feko_workflow` imports one CAD file, drops solids,
-removes duplicate surfaces, drops excluded surfaces, stitches, meshes, decides
-the material pairs, creates one component per boundary group, moves the
-elements in, and exports the grouped mesh.
+The staged preset `run_catia_feko_workflow` starts by asking the operator
+whether to decide the material pairs before duplicate removal. `action="start"`
+returns only the question, the reason, a coarse-mesh hint, two options and a
+token; nothing is imported and no entity is touched. `action="classify"`
+imports the CAD file, builds the closed reference shells from every material
+surface, writes the pair table and stops for confirmation. `action="produce"`
+runs the production steps only after `confirm_pairs=true`. `action="skip"`
+records that the pairs are undetermined and does not assume a production
+chain. The reference pass may use a coarse `reference_element_size`; it never
+reaches the final mesh.
 
 Required inputs:
 
@@ -102,13 +109,13 @@ Required inputs:
 | `face_tags` | Face-only boundaries such as PEC or impedance sheets |
 | `element_size` | Target element size |
 | `export_name` | Output name ending in `.fhm` |
-| `mode` | `verification` on the first run, `general` on repeat runs |
+| `mode` | Retained for compatibility; `classify` uses verification semantics and `produce` uses general semantics |
 
-Use `mode="verification"` when the material pairs are not yet known. It meshes
-all material surfaces, including duplicates and surfaces that will be dropped,
-because each material must form a closed shell. It writes the pair table, then
-removes the reference mesh and continues in the same model. Use
-`mode="general"` to reuse an existing pair table on the same geometry.
+The classify pass meshes all material surfaces, including duplicates and
+surfaces that will be dropped, because each material must form a closed shell.
+It writes the pair table, removes the reference mesh, and continues in the same
+model. The produce pass reads that table instead of repeating the reference
+pass. The `action` now decides which pass runs, not `mode`.
 
 Rules that are not optional:
 
@@ -125,6 +132,55 @@ Rules that are not optional:
 - Only empty components may be deleted. A component holding elements,
   surfaces, solids, lines, or points is refused before a checkpoint is written.
 
+### Material-pair interlock
+
+After a CATIA import, and until the material pairs are decided, the server
+interlocks every operation that changes the surface set. The pairs rely on a
+closed reference shell per material: removing duplicates, deleting surfaces,
+stitching or trimming can open that shell and corrupt the winding-number
+pairs, while the pair table still looks plausible.
+
+The model-level interlock is armed by `import_live_cad` for a `.CATPart` or
+`.CATProduct` file, which returns `material_pair_gate` with the question. The
+staged preset `action="start"` puts the same question to the operator before
+anything is imported; `action="classify"` arms the interlock when it imports
+the CAD file and clears it when the classification succeeds.
+
+While the interlock is open, these tools perform no work and return the
+question verbatim with `status="decision_required"`:
+
+| Tool | Operation held back |
+|---|---|
+| `remove_live_duplicate_surfaces` | duplicate removal |
+| `delete_live_entities` (`surface`, `solid`) | surface or solid deletion |
+| `stitch_live_free_edges` | free-edge stitching |
+| `trim_live_free_edges` | free-edge trimming |
+
+Read-only queries and reference meshing are not affected.
+
+The model-level state is held in server process memory:
+
+| Stage | Meaning | The four tools above |
+|---|---|---|
+| `pending` | imported, not answered | blocked |
+| `authorized` | operator chose classification, not finished | blocked |
+| `classified` | classification done | open |
+| `skipped` | operator chose to skip | open; pairs recorded as undetermined |
+
+To resolve it:
+
+- Choose classification: call
+  `resolve_material_pair_decision(decision="classify")`, then finish
+  `classify_material_pairs`; a successful classification moves the gate to
+  `classified`. `run_catia_feko_workflow` `action="classify"` does both.
+- Choose to skip: call `resolve_material_pair_decision(decision="skip")`. The
+  interlock opens, the pairs stay undetermined, and nothing else runs.
+
+The state lives only in the server process and is not saved with the model.
+Restarting the server clears it; a new import arms it again. A
+`decision_required` result is a stop for the operator, not a failure - do not
+reach the same change through another tool.
+
 The full operator prompt is
 [`PROMPTS/catia-feko-workflow.md`](PROMPTS/catia-feko-workflow.md).
 
@@ -135,7 +191,7 @@ The full operator prompt is
 | Environment and projects | `get_environment`, `create_project`, `import_project_file` |
 | Live session | `get_live_bridge_status`, `get_live_session_info`, `get_live_model_summary` |
 | Geometry and mesh | `import_live_cad`, `automesh_live_surfaces`, `solid_map_live_solids`, `tetra_mesh_live_solids`, `get_live_mesh_quality`, `repair_live_mesh_quality` |
-| FEKO | `export_live_feko_mesh`, `classify_material_pairs`, `run_catia_feko_workflow` |
+| FEKO | `export_live_feko_mesh`, `classify_material_pairs`, `resolve_material_pair_decision`, `run_catia_feko_workflow` |
 | Connections | `create_live_rigid_link`, `create_live_rbe3`, `create_live_weld`, `create_live_spot_weld` |
 | Solver jobs | `prepare_analysis_template`, `submit_solver_job`, `get_job_status`, `tail_job_log`, `get_solver_result_artifacts` |
 | Post-processing | `postprocess_solver_result_in_hyperview`, `extract_solver_time_history_in_hypergraph`, `generate_solver_job_report` |
@@ -209,7 +265,7 @@ $env:PYTHONPATH = 'src'
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-The suite has 106 tests and takes about 3 seconds. It does not start
+The suite has 120 tests and takes about 4 seconds. It does not start
 HyperWorks, submit a solver job, or consume a license. See
 [`tests/README.md`](tests/README.md) for what each file covers.
 
@@ -223,6 +279,9 @@ HyperWorks, submit a solver job, or consume a license. See
 - Generic connector realization and fasteners remain profile-gated.
 - Remeshing an existing mesh with `keep_existing_mesh=false` can reuse element
   IDs and roll back. Return to a mesh-free checkpoint first.
+- Passing `model_name` to `import_live_cad` before the model exists returns
+  `HyperMesh model not found` and imports nothing. Omit the parameter for a
+  fresh import and rename the model afterwards.
 - The cylindrical O-grid tool is a bounded radial topology, not a replacement
   for the interactive HyperMesh O-grid panel.
 

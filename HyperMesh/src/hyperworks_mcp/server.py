@@ -28,15 +28,33 @@ from .launcher import (
 )
 from .live_bridge import LiveBridgeClient
 from .material_pairs import classify
-from .workflow import WorkflowConfig, WorkflowError
-from .workflow import run as run_workflow
+from .workflow import WorkflowConfig
+from .workflow_gate import GATE, decision_payload, run_key as workflow_run_key
+from . import workflow_stages
 from .projects import ProjectService
 from .radioss_results import audit_radioss_output_files
 from .reporting import write_job_report
 from .settings import Settings
 
 
-INSTRUCTIONS = """Control Altair HyperWorks through typed, workspace-scoped tools.
+INSTRUCTIONS = """OPERATOR DECISIONS - STOP AND ASK.
+Many choices in this server change the physical model or the meaning of its result, and
+the tools cannot choose them for you. Before any modifying call, stop and ask the operator
+when a value is missing, ambiguous, or contradicted by what the tools returned. This
+includes, at minimum: the surface-to-material map and which surfaces to exclude; face
+attributes that have no volume (ideal conductor, impedance sheet, symmetry plane,
+coating); element size, element type, and mesh type; which CAD parameter to change and
+its new value; how to treat labels reported undecided, agreement below 1.0, same-medium
+faces, free edges, duplicate or overlapping surfaces, and other items the tools only
+report; and whether to delete, roll back, overwrite, or save over an existing model.
+Never infer these from geometry, from a previous run, or from a default. A question must
+name the decision, the candidate answers, and the consequence of each. If the client
+supports MCP elicitation, use it; otherwise ask in your reply and do not call a modifying
+tool until the operator answers. A result that carries questions, undecided labels, or
+operator_report_required is a stop, not a warning to work around. Only the operator may
+authorize proceeding with an unresolved item.
+
+Control Altair HyperWorks through typed, workspace-scoped tools.
 Use get_environment before launching anything. Prefer HyperMesh batch Tcl for repeatable
 pre-processing and use GUI launch only when interactive work is required. Tcl scripts are
 screened against OS/process escape commands and run from isolated project/job folders.
@@ -81,18 +99,39 @@ surfaces that will be excluded later included. Classifying a mesh from which sur
 were already removed opens the shells and silently corrupts the pairs. The outside name
 may also name a material: an enclosed cavity holding the same medium as the surroundings
 is one medium, and both report that same name. A label whose two sides resolve to the
-same medium is reported separately, not grouped.
-The same chain is available as one optional preset, run_catia_feko_workflow: import the
-CAD file, drop solids, remove duplicates, drop the excluded surfaces, stitch, mesh,
-decide the pairs, create one component per boundary group, move the elements in, and
-export the grouped mesh. It is a convenience, not the only route; every step above stays
-callable on its own. Its verification mode builds the closed reference shells from all
-material surfaces, writes the pair table, deletes the reference components together with
-their elements, and then runs the production steps in that same model - the CAD file is
-imported exactly once per run, and no reference element reaches the exported mesh. Its
-general mode reuses that table and skips the reference pass on a repeat run. The workflow
-imports into an empty model; it refuses to start when surfaces or elements already exist,
-because imported IDs would shift.
+same medium and carries no face tag is reported separately, not grouped; the same medium
+with a face tag is still a boundary - a perfect-conductor sheet inside air is grouped as
+air-air-PEC.
+Grouping is a surface-level decision, not an element-level one. Decide before the
+production mesh which surfaces belong to which boundary group: one ordered material pair
+plus the face tags yields one group name per surface, and the pair table records that
+decision. A group is then moved by selecting its surfaces (organize_live_elements with
+surface_ids) instead of its elements, so no per-element decision is made after meshing.
+That selection relies on HyperMesh's element-to-surface association, which is created when
+the surface is meshed. The reference pass makes the link explicit: it meshes one surface
+at a time into the component named for that surface, and the handler refuses elements that
+land outside it, so component membership is the record. The production pass meshes all
+surfaces in one call to keep shared edges conformal and keeps no such record. The tools do
+not read the association back or verify it. Before accepting a grouped mesh, count
+elements per surface, check every count is non-zero, check the sum equals the mesh total,
+and check no element is claimed by two surfaces. Without that check the grouping is
+expected to be correct, not verified.
+run_catia_feko_workflow is staged and starts with a question, not with work. action="start"
+returns the material-pair decision - whether to decide the pairs before duplicate removal
+and surface deletion - with a coarse-mesh hint, two options and a token. Put it to the
+operator; do not choose for them. action="classify" imports, meshes every material surface
+as its own reference component, computes the ordered pairs, writes the table, deletes the
+reference components and stops for confirmation; no duplicate has been removed and no
+surface deleted. action="skip" records that the pairs are undetermined and stops without
+importing or changing anything; the next task is whatever the operator specifies.
+action="produce" runs only after the operator confirms the table with confirm_pairs=true,
+continuing from the already imported geometry. The reference pass may use a coarse
+reference_element_size; it is only for the pair decision and never reaches the final mesh.
+The primitive duplicate, delete, stitch and trim tools
+enforce the same gate and return decision_required instead of changing the model while it is open.
+A CATIA import through import_live_cad opens that gate and returns the question in
+material_pair_gate. The workflow imports into an empty model; it refuses to start when
+surfaces or elements already exist, because imported IDs would shift.
 runhwx.exe may open a launch selector window before the application starts. When the user
 setting launcher_show_on_startup is 1, that window always appears, waits for a product and
 a Create Session click, and the live bridge does not answer until the session exists - the
@@ -958,7 +997,18 @@ def delete_live_entities(
     deletion, nodes for element deletion, and elements, surfaces, solids, lines,
     or points for component deletion). Only empty components are accepted,
     because HyperMesh deletes a component's contents together with it.
+
+    Surface and solid deletion is refused while the CATIA material-pair gate is
+    open: removing a surface before the reference pass can open a material
+    shell and corrupt the pairs.  The returned decision_required payload must
+    be put to the operator.
     """
+    if entity_type in ("surface", "solid"):
+        blocked = GATE.require_model_clear(
+            model_name, operation=f"delete_{entity_type}"
+        )
+        if blocked is not None:
+            return blocked
     return live.call(
         "delete_entities",
         {
@@ -1257,7 +1307,16 @@ def remove_live_duplicate_surfaces(
 
     A checkpoint is created before deletion and restored if the deleted set
     differs from the detected duplicates or if a solid is lost.
+
+    The call is refused while the CATIA material-pair gate is open.  Removing
+    a duplicate before the reference pass can open a material shell; the
+    returned decision_required payload must be put to the operator.
     """
+    blocked = GATE.require_model_clear(
+        model_name, operation="remove_duplicate_surfaces"
+    )
+    if blocked is not None:
+        return blocked
     return live.call(
         "remove_duplicate_surfaces",
         {
@@ -1284,7 +1343,14 @@ def stitch_live_free_edges(
     because edge IDs change. The run stops when a full pass merges nothing or
     max_attempts is reached. A checkpoint is created before stitching and
     restored if the surface set changes or the free-edge count increases.
+
+    The call is refused while the CATIA material-pair gate is open: stitching
+    rewrites the surface-edge topology the reference shells are built from, and
+    the returned decision_required payload must be put to the operator.
     """
+    blocked = GATE.require_model_clear(model_name, operation="stitch_free_edges")
+    if blocked is not None:
+        return blocked
     return live.call(
         "stitch_free_edges",
         {
@@ -1312,7 +1378,15 @@ def trim_live_free_edges(
     supplied vector. The live bridge checkpoints the model and restores it when
     nothing changes, when the element count drops, or when the free-edge count
     increases. Review the returned risk annotations before continuing.
+
+    The call is refused while the CATIA material-pair gate is open: trimming
+    splits surfaces and changes the surface set the reference shells are built
+    from, and the returned decision_required payload must be put to the
+    operator.
     """
+    blocked = GATE.require_model_clear(model_name, operation="trim_free_edges")
+    if blocked is not None:
+        return blocked
     return live.call(
         "trim_free_edges",
         {
@@ -1384,6 +1458,15 @@ def organize_live_elements(
     attached to. Connectivity and element IDs are preserved; only the owning
     collector changes. A checkpoint is written before the move. mode="copy"
     duplicates the marked elements instead of moving them.
+
+    A surface-based selection uses HyperMesh's element-to-surface
+    association, which is created when the surface is meshed. The reference
+    pass makes that link explicit by meshing each surface into its own
+    component; the production pass meshes all surfaces in one call for
+    conformal shared edges and keeps no such record. The handler does not
+    verify the association. Before accepting a grouped mesh, count elements
+    per surface, check every count is non-zero, check the sum equals the mesh
+    total, and check no element is selected by two surfaces.
     """
     return live.call(
         "organize_elements",
@@ -1753,7 +1836,7 @@ def import_live_cad(
         raise ValueError(
             "input_name must refer to a STEP, IGES, Parasolid, or CATIA project input"
         )
-    return live.call(
+    result = live.call(
         "import_cad",
         {
             "input_file": str(input_file),
@@ -1763,6 +1846,22 @@ def import_live_cad(
         },
         timeout=900,
     )
+    if input_file.suffix.lower() in {".catpart", ".catproduct"}:
+        # A CATIA import starts the FEKO-oriented path, where the material
+        # decision must precede duplicate removal and surface deletion.  The
+        # gate makes the primitive tools stop and ask even when the caller did
+        # not use the staged workflow.
+        gate = GATE.arm_model(model_name, source=str(input_file))
+        result = dict(result)
+        result["material_pair_gate"] = decision_payload(
+            gate["token"], operation="import_live_cad"
+        )
+        result["material_pair_gate"]["gate_stage"] = gate["stage"]
+        result["material_pair_gate"]["resolved_by"] = (
+            "call resolve_material_pair_decision, or use "
+            "run_catia_feko_workflow action='classify'"
+        )
+    return result
 
 
 @mcp.tool()
@@ -1770,12 +1869,13 @@ def automesh_live_surfaces(
     surface_ids: list[int],
     element_size: float,
     element_type: Literal["tria", "quad", "mixed", "right_tria", "quad_only"] = "mixed",
-    mesh_type: Literal[
+    density_mode: Literal[
         "proximity_curvature",
         "curvature",
         "proximity_curvature_free_edge",
         "curvature_free_edge",
     ] = "proximity_curvature",
+    mesh_algorithm: Literal["free", "mapped"] = "free",
     min_size: float | None = None,
     max_size: float | None = None,
     chordal_deviation: float | None = None,
@@ -1784,8 +1884,16 @@ def automesh_live_surfaces(
     keep_existing_mesh: bool = True,
     component_id: int | None = None,
     model_name: str | None = None,
+    mesh_type: str | None = None,
 ) -> dict:
-    """Generate curvature/proximity-controlled shell mesh on explicit live surface IDs.
+    """Generate a free surface mesh on explicit live surface IDs.
+
+    The Surface Mesh panel has two separate controls.  ``mesh_algorithm`` is
+    the GUI Mesh type: ``free`` uses HyperMesh's unstructured growth mesher and
+    is the only algorithm implemented; ``mapped`` is rejected.  The
+    ``density_mode`` values control Proximity/Curvature density and are not the
+    Free/Mapped selector.  ``mesh_type`` is a deprecated alias for
+    ``density_mode``; do not read it as the GUI Mesh type.
 
     When component_id is given, the mesh is organized into that component and
     membership is verified before returning.  element_count is the true total;
@@ -1798,7 +1906,8 @@ def automesh_live_surfaces(
             "surface_ids": surface_ids,
             "element_size": element_size,
             "element_type": element_type,
-            "mesh_type": mesh_type,
+            "density_mode": density_mode,
+            "mesh_algorithm": mesh_algorithm,
             "min_size": min_size,
             "max_size": max_size,
             "chordal_deviation": chordal_deviation,
@@ -1807,6 +1916,7 @@ def automesh_live_surfaces(
             "keep_existing_mesh": keep_existing_mesh,
             "component_id": component_id,
             "model_name": model_name,
+            "mesh_type": mesh_type,
         },
         timeout=900,
     )
@@ -2085,6 +2195,7 @@ def classify_material_pairs(
     samples: int = 10,
     threshold: float = 0.55,
     outside: str = "air",
+    model_name: str | None = None,
 ) -> dict:
     """Name the two materials on either side of each labelled surface.
 
@@ -2113,6 +2224,11 @@ def classify_material_pairs(
     the sampled triangles, and the winding margin.  An ordered pair matters:
     air/carrier and carrier/air are different boundary groups.  A label whose
     votes split is not decided - list it for the operator instead of picking.
+
+    A successful call also clears the model-level material-pair gate that a
+    CATIA import opened, because this is the classification the gate asked
+    for.  The pair table from the staged workflow is still the one production
+    reads; this tool is the manual equivalent.
     """
     path = settings.workspace / "export" / Path(fhm_name).name
     if not path.exists():
@@ -2128,7 +2244,69 @@ def classify_material_pairs(
         threshold=float(threshold),
         outside=outside,
     )
+    GATE.mark_model_classified(model_name)
     return report.as_dict()
+
+
+@mcp.tool()
+def resolve_material_pair_decision(
+    decision: Literal["classify", "skip"],
+    model_name: str | None = None,
+    token: str | None = None,
+) -> dict:
+    """Answer the material-pair gate that a CATIA import opened.
+
+    The gate exists because duplicate removal and surface deletion must not
+    run before the material pairs are decided: an open reference shell
+    silently corrupts the pairs.  ``decision="classify"`` only authorizes the
+    work; duplicate removal and deletion stay blocked until
+    ``classify_material_pairs`` succeeds.  ``decision="skip"`` records that the
+    pairs are undetermined and opens the gate, but performs no other task.
+    """
+    gate = GATE.model_gate(model_name)
+    if gate is None:
+        return {
+            "status": "no_pending_gate",
+            "stage": "material_pair_decision",
+            "model_name": model_name,
+            "instructions": (
+                "当前模型没有待回答的材料对问题；如果刚导入 CATIA 文件，"
+                "请先调用 import_live_cad。"
+            ),
+        }
+    if token is not None and token != gate["token"]:
+        raise ValueError("token does not match the pending material-pair gate")
+    if gate["stage"] == "authorized" and decision == "skip":
+        raise ValueError(
+            "material-pair classification was already authorized; finish it "
+            "or start a new run instead of skipping it"
+        )
+    resolved = GATE.resolve_model(model_name, decision)
+    if decision == "classify":
+        return {
+            "status": "authorized",
+            "stage": "material_pair_decision",
+            "decision": "classify",
+            "gate_stage": resolved["stage"],
+            "token": resolved["token"],
+            "instructions": (
+                "材料对判定已获授权，但尚未完成。请用 classify_material_pairs "
+                "或 run_catia_feko_workflow 的 classify 阶段完成判定；"
+                "在判定完成前，去重和删面仍被阻止。"
+            ),
+        }
+    return {
+        "status": "skipped",
+        "stage": "material_pair_decision",
+        "decision": "skip",
+        "gate_stage": resolved["stage"],
+        "token": resolved["token"],
+        "material_pairs": "not_determined",
+        "instructions": (
+            "材料对未判定，去重和删面已放行。未执行任何其他操作；"
+            "下一步由操作者指定。"
+        ),
+    }
 
 
 @mcp.tool()
@@ -2145,56 +2323,110 @@ def run_catia_feko_workflow(
     duplicate_tolerance: float = 0.1,
     stitch_tolerance: float = 0.2,
     element_type: str = "tria",
-    mesh_type: str = "proximity_curvature",
+    mesh_type: str | None = None,
+    density_mode: str | None = None,
+    mesh_algorithm: Literal["free", "mapped"] = "free",
     min_size: float | None = None,
     max_size: float | None = None,
+    reference_element_size: float | None = None,
     face_tags: dict[str, list[str]] | None = None,
     samples: int = 10,
     threshold: float = 0.55,
     outside: str = "air",
     template_file: str | None = None,
     stop_after: str | None = None,
+    action: Literal["start", "classify", "skip", "produce", "status"] = "start",
+    token: str | None = None,
+    confirm_pairs: bool = False,
 ) -> dict:
-    """Run the fixed CAD-to-FEKO chain on one project input.
+    """Run the staged CATIA-to-FEKO chain with an operator gate.
 
-    The production steps are always import, drop solids, remove duplicates,
-    drop the excluded surfaces, stitch, mesh, decide surface pairs, create one
-    component per boundary group, move the elements in, and export one .fhm
-    whose labels are the group names.
+    The tool is a small state machine.  Its first action is a question the
+    assistant must put to the operator:
 
-    ``mode="verification"`` computes the pairs.  The winding-number method
-    needs every material to be a closed shell, so this pass meshes *all*
-    surfaces in ``surface_materials`` - duplicates and later-excluded surfaces
-    included - exports that reference mesh, classifies it, and writes the pair
-    table.  It then deletes the reference components together with their
-    elements and runs the production steps in that same model, so the CAD file
-    is imported exactly once per run and no reference element reaches the
-    exported mesh.  ``mode="general"`` skips the reference pass and reads the
-    pairs from the table, so repeat runs on the same geometry are fast.  Run a
-    model once in verification mode before using general mode.  Both modes
-    require an empty model and fail on the preflight check otherwise.
+    ``action="start"``
+        Return ``status="decision_required"`` with the question, the reason,
+        a coarse-mesh hint, two options and a token.  Nothing is imported and
+        no model entity is touched.  Ask the operator; do not choose for them.
 
-    ``surface_materials`` maps surface ID (as a string key) to material name;
-    a surface left out of the mapping is neither meshed nor grouped, and
-    leaving one out also opens its material's shell.  ``drop_surfaces`` lists
-    surfaces to delete after the duplicate removal, but they must stay in
-    ``surface_materials`` so the reference pass can close the shells.
-    ``face_tags`` adds simulation assignments that live on a face - ideal
-    conductor, impedance boundary, symmetry plane - which probing cannot see.
-    A surface whose two sides resolve to the same medium is listed in
-    ``same_medium`` and left out of the groups.  ``stop_after`` names a step
-    to halt at, returning everything done so far; an unknown name is rejected
-    before the model is touched.
+    ``action="classify"``
+        After the operator chose classification.  Import the CAD file, mesh
+        every surface in ``surface_materials`` as its own reference component,
+        export the reference mesh, compute the ordered material pairs, write
+        the pair table, delete the reference components, and stop.  Duplicates
+        and excluded surfaces stay in the model for this pass.  The model is
+        left with the original geometry and no elements; no duplicate removal
+        or surface deletion has happened.
+
+    ``action="skip"``
+        After the operator chose not to classify.  Record the decision and
+        stop.  Nothing is imported, removed, meshed or exported.  The caller
+        must ask what other task to do; this tool does not assume a production
+        chain.
+
+    ``action="produce"``
+        Only after the operator confirms the pair table with
+        ``confirm_pairs=true``.  Continue from the already imported geometry:
+        drop solids, remove duplicates, drop excluded surfaces, stitch, mesh,
+        create one component per boundary group, move the elements in, and
+        export the grouped .fhm.  It does not import again.
+
+    ``action="status"``
+        Report the current stage without changing the model.  A session is
+        keyed by the input parameters, so ``start`` is idempotent.
+
+    ``reference_element_size`` is optional and only affects the reference
+    pass.  A coarse mesh is enough for the pair decision; its size is the
+    operator's choice, and the tool supplies no default number.  The
+    production mesh always uses ``element_size``.
+
+    The decision must come before duplicate removal and surface deletion,
+    because removing a surface can open a material's reference shell and
+    silently corrupt the winding-number pairs.  The primitive duplicate,
+    delete, stitch and trim tools enforce the same gate.  ``surface_materials``
+    must include every material-bearing surface, duplicates and later-excluded
+    surfaces included.  ``face_tags`` carries assignments that live on a face
+    and have no volume.  ``mode`` and ``stop_after`` are retained for
+    compatibility: ``classify`` uses verification semantics, ``produce``
+    reads the table, and ``stop_after`` can halt a production run at a named
+    step.
+
+    ``mesh_algorithm`` is the GUI Mesh type; only ``free`` is implemented.
+    ``density_mode`` is the Proximity/Curvature size-control setting.
+    ``mesh_type`` is a deprecated alias for ``density_mode`` and is not the
+    Free/Mapped selector.
     """
     if not surface_materials:
         raise ValueError("surface_materials must name at least one surface")
+    if mesh_type in ("free", "mapped"):
+        if mesh_algorithm != "free" and mesh_algorithm != mesh_type:
+            raise ValueError("mesh_algorithm and mesh_type disagree")
+        mesh_algorithm = mesh_type
+        mesh_type = None
+    if density_mode is not None and mesh_type is not None and density_mode != mesh_type:
+        raise ValueError("density_mode and mesh_type disagree; mesh_type is deprecated")
+    resolved_density = density_mode or mesh_type or "proximity_curvature"
+    if mesh_algorithm != "free":
+        raise ValueError(
+            "Mapped surface meshing is not implemented; use mesh_algorithm='free'"
+        )
     input_file = projects.input_file(project_id, input_name)
+    # The template is only needed when a mesh is exported.  Resolving it on
+    # action="start" would fail before the operator ever sees the question.
+    resolved_template = (
+        _feko_template(template_file)
+        if action in ("classify", "produce")
+        else template_file
+    )
     config = WorkflowConfig(
         input_file=str(input_file),
         export_name=Path(export_name).name,
         element_size=float(element_size),
-        template_file=_feko_template(template_file),
         surface_materials={int(key): str(value) for key, value in surface_materials.items()},
+        reference_element_size=(
+            None if reference_element_size is None else float(reference_element_size)
+        ),
+        template_file=resolved_template,
         mode=mode,
         translator=translator or "",
         drop_solids=bool(drop_solids),
@@ -2202,7 +2434,8 @@ def run_catia_feko_workflow(
         duplicate_tolerance=float(duplicate_tolerance),
         stitch_tolerance=float(stitch_tolerance),
         element_type=element_type,
-        mesh_type=mesh_type,
+        density_mode=resolved_density,
+        mesh_algorithm=mesh_algorithm,
         min_size=None if min_size is None else float(min_size),
         max_size=None if max_size is None else float(max_size),
         face_tags={
@@ -2213,7 +2446,62 @@ def run_catia_feko_workflow(
         outside=str(outside),
         stop_after=stop_after,
     )
-    return run_workflow(live.call, config, settings.workspace / "export")
+    run_key_value = workflow_run_key(
+        {
+            "project_id": project_id,
+            "input_name": input_name,
+            "export_name": Path(export_name).name,
+            "surface_materials": {
+                str(key): str(value)
+                for key, value in sorted(surface_materials.items())
+            },
+            "drop_surfaces": sorted(int(value) for value in (drop_surfaces or ())),
+            "face_tags": {
+                str(key): sorted(str(value) for value in values)
+                for key, values in sorted((face_tags or {}).items())
+            },
+            "element_size": float(element_size),
+            "reference_element_size": (
+                None if reference_element_size is None else float(reference_element_size)
+            ),
+            "duplicate_tolerance": float(duplicate_tolerance),
+            "mode": mode,
+        }
+    )
+    export_dir = settings.workspace / "export"
+
+    if action == "start":
+        return workflow_stages.start(config, export_dir, run_key_value)
+
+    if action == "status":
+        if token is None:
+            session = GATE.session_by_key(run_key_value)
+            if session is None:
+                return {
+                    "status": "no_session",
+                    "stage": "material_pair_decision",
+                    "instructions": (
+                        "没有找到这次配置的运行记录；请先调用 action='start'。"
+                    ),
+                }
+        else:
+            session = GATE.session(token)
+        return workflow_stages.status(session)
+
+    if token is None:
+        raise ValueError(
+            f"action={action!r} needs the token returned by action='start'"
+        )
+    session = GATE.session(token)
+    if action == "classify":
+        return workflow_stages.classify(session, live.call, config, export_dir)
+    if action == "skip":
+        return workflow_stages.skip(session)
+    if action == "produce":
+        return workflow_stages.produce(
+            session, live.call, config, export_dir, bool(confirm_pairs)
+        )
+    raise ValueError(f"unknown action {action!r}")
 
 
 @mcp.resource("hyperworks://environment")

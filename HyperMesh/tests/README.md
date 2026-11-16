@@ -8,7 +8,7 @@ $env:PYTHONPATH = 'src'
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-`pytest` is the supported runner. It reports 106 tests in about 3 seconds.
+`pytest` is the supported runner. It reports 120 tests in about 4 seconds.
 `python -m unittest discover` shows fewer cases because it does not count
 parametrized pytest cases the same way.
 
@@ -25,7 +25,8 @@ parametrized pytest cases the same way.
 | `test_live_bridge.py` | Authenticated localhost round trip and explicit handling of a missing bridge config |
 | `test_extension_handlers.py` | In-application handler contracts: session and entity queries, creation, deletion, surface repair, stitching, trimming, overlap review, checkpoints, model loading, solver cards, tetra meshing, quality repair, and HyperView post-processing |
 | `test_material_pairs.py` | FEKO material classification: label parsing, winding numbers, ordered pairs, face tags, same-medium surfaces, unknown labels, and element sampling |
-| `test_workflow.py` | `run_catia_feko_workflow` step order, verification and general modes, empty-model preflight, `stop_after`, duplicate-surface removal, and reference-mesh cleanup |
+| `test_workflow.py` | `run_catia_feko_workflow` step order, verification and general modes, empty-model preflight, `stop_after`, duplicate-surface removal, reference-mesh cleanup, `reference_element_size`, resume, and same-medium face tags |
+| `test_workflow_gate.py` | Staged start/classify/produce/skip flow, the model-level material-pair gate, and the duplicate, delete, stitch, and trim tools returning `decision_required` while it is open |
 | `test_analysis_profiles.py` | Construction and validation of OptiStruct and Radioss template chains |
 | `test_templates_and_reporting.py` | Template registry dispatch and HTML/JSON job reports |
 | `test_radioss_results.py` | Parsing of Engine quality signals and application of explicit quality gates |

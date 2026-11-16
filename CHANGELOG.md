@@ -2,6 +2,22 @@
 
 本文件记录公开版本的阶段变更。
 
+## 2026-11-16 材料对判定拦截门
+
+### 新增与修正
+
+- `run_catia_feko_workflow` 改为分阶段执行：`start` 只返回材料对问题、理由、粗网格提示、选项与令牌；`classify` 导入 CAD、建立封闭参考壳、写配对表并停在确认点；`produce` 需 `confirm_pairs=true` 才执行生产步骤；`skip` 记录材料对未判定并停止；`status` 只读查询当前阶段。新增 `reference_element_size`，仅用于参考网格，不进入最终网格。
+- 新增进程内模型级拦截门（`workflow_gate.py`），按 `pending`、`authorized`、`classified`、`skipped` 四态记录材料对判定进度。
+- `remove_live_duplicate_surfaces`、`delete_live_entities`（`surface`、`solid`）、`stitch_live_free_edges` 与 `trim_live_free_edges` 在拦截门打开期间返回 `decision_required` 及问题全文，不执行操作。缝合与修剪会改写参考壳所用的曲面与边拓扑，一并纳入拦截。
+- 新增 `resolve_material_pair_decision`，用于回答拦截门提出的问题；`classify_material_pairs` 新增 `model_name` 参数，判定成功后解除拦截。
+- `import_live_cad` 导入 `.CATPart` 或 `.CATProduct` 时在返回中附带 `material_pair_gate`，即使调用方未使用分阶段工作流也会触发拦截。
+- 新增 `workflow_stages.py` 与 `tests/test_workflow_gate.py`；测试 120 项通过。
+
+### 范围说明
+
+- 拦截只针对改变曲面集合的操作；只读查询、参考网格划分与不改变曲面集合的建模操作不受影响。
+- 拦截状态保存在服务进程内，不写入模型文件，重启服务后清空。
+
 ## 2026-11-16 文档整理
 
 - README 改为入口式结构：功能范围、环境要求、安装、快速开始、工具分组、测试、限制与文档索引。逐版本细节移入本文件。

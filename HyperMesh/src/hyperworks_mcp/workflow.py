@@ -27,12 +27,43 @@ material pairs come from:
 
 Both modes end with one component per boundary group and a single ``.fhm``
 export whose labels are the group names.  A surface whose two sides resolve to
-the same medium carries no material contrast; it is reported separately and
-left out of the groups.  Both modes import into an empty model; a preflight
+the same medium carries no material contrast; without a face tag it is
+reported separately and left out of the groups, while a tagged sheet inside
+one medium (a perfect conductor in air, for example) is a real boundary and is
+grouped under its repeated medium name.  Both modes import into an empty model; a preflight
 check refuses to start when surfaces or elements are already present, because
 the imported IDs would no longer match the caller's surface map.  Every step
 records what it did, and ``stop_after`` halts the chain at a named step for
 inspection; an unknown step name is rejected before the run starts.
+
+Grouping is decided per surface, not per element
+------------------------------------------------
+The reviewable way to group is to decide before the production mesh which
+surfaces belong to which boundary group: one ordered material pair plus the
+face tags yields one group name per surface, and a group can then be moved by
+selecting its surfaces instead of its elements.  That decision is what the
+pair table records; it does not depend on the mesh.
+
+The link between a surface and its elements can be known in two ways.
+
+The explicit way is to mesh one surface at a time into a component named for
+that surface.  The reference pass does exactly this: ``automesh_surfaces`` is
+called once per surface with that surface's component, and the in-application
+handler refuses a result that places any created element outside the
+requested component.  Component membership is then the mesh-to-surface
+record, and nothing has to be inferred later.
+
+The production pass deliberately does not do this.  Meshing all surfaces in
+one call keeps adjacent surfaces conformal across shared edges; meshing each
+surface separately can leave duplicate nodes at a boundary between groups.
+So the production mesh is one call, and the only link between an element and
+its surface is the association HyperMesh creates while meshing.  Grouping
+selects elements through that association (``by surface``).  This module does
+not read the association back or verify it.  Before a grouped mesh is
+accepted, mark every planned surface, count its elements, check every count is
+non-zero, check the counts sum to the mesh total, and check no element is
+claimed by two surfaces.  Without that check the result is expected to be
+correct, not verified.
 """
 
 from __future__ import annotations
@@ -80,6 +111,7 @@ class WorkflowConfig:
     export_name: str
     element_size: float
     surface_materials: Mapping[int, str]
+    reference_element_size: float | None = None
     mode: str = GENERAL
     translator: str = "catia_ct"
     drop_solids: bool = True
@@ -87,7 +119,9 @@ class WorkflowConfig:
     duplicate_tolerance: float = 0.1
     stitch_tolerance: float = 0.2
     element_type: str = "tria"
-    mesh_type: str = "proximity_curvature"
+    mesh_type: str | None = None
+    density_mode: str = "proximity_curvature"
+    mesh_algorithm: str = "free"
     min_size: float | None = None
     max_size: float | None = None
     face_tags: Mapping[int, Sequence[str]] = field(default_factory=dict)
@@ -96,6 +130,28 @@ class WorkflowConfig:
     outside: str = OUTSIDE
     template_file: str | None = None
     stop_after: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.mesh_type in ("free", "mapped"):
+            if self.mesh_algorithm != "free" and self.mesh_algorithm != self.mesh_type:
+                raise ValueError("mesh_algorithm and mesh_type disagree")
+            self.mesh_algorithm = self.mesh_type
+            self.mesh_type = None
+        if self.mesh_type is not None:
+            if (
+                self.density_mode != "proximity_curvature"
+                and self.density_mode != self.mesh_type
+            ):
+                raise ValueError("density_mode and mesh_type disagree")
+            self.density_mode = self.mesh_type
+        # Keep the old read path working; the value is a density mode, not the
+        # GUI Mesh type (Free/Mapped).
+        self.mesh_type = self.density_mode
+        if self.mesh_algorithm != "free":
+            raise ValueError(
+                "Mapped surface meshing is not implemented; "
+                "use mesh_algorithm='free'"
+            )
 
     def retained(self) -> list[int]:
         dropped = set(self.drop_surfaces)
@@ -115,14 +171,27 @@ def pair_table_name(export_name: str) -> str:
     return Path(export_name).stem + ".pairs.json"
 
 
-def run(executor: Executor, config: WorkflowConfig, export_dir: str | Path) -> dict:
-    """Run the chain and return every step's result."""
+def run(
+    executor: Executor,
+    config: WorkflowConfig,
+    export_dir: str | Path,
+    resume: Mapping | None = None,
+) -> dict:
+    """Run the chain and return every step's result.
+
+    ``resume`` continues a run whose import and reference pass already
+    happened.  It carries the import result under ``imported`` and skips the
+    empty-model preflight, the import and the reference pass; the production
+    chain starts at ``drop_solids``.  The reference mesh must already be
+    cleared, and the pair table must already exist.
+    """
     if config.mode not in MODES:
         raise WorkflowError(f"mode must be one of {MODES}, got {config.mode!r}")
     if not config.surface_materials:
         raise WorkflowError("surface_materials must name at least one surface")
+    resuming = resume is not None
     allowed_steps = set(PRODUCTION_STEPS)
-    if config.mode == VERIFICATION:
+    if config.mode == VERIFICATION and not resuming:
         allowed_steps |= set(REFERENCE_STEPS)
     if config.stop_after is not None and config.stop_after not in allowed_steps:
         raise WorkflowError(
@@ -142,10 +211,18 @@ def run(executor: Executor, config: WorkflowConfig, export_dir: str | Path) -> d
             f"general mode needs a pair table at {table_path}; "
             "run the same model once in verification mode first"
         )
+    if resuming and not table_path.exists():
+        # The classify stage must have written the table before production.
+        raise WorkflowError(
+            f"a resumed run needs the pair table at {table_path}; "
+            "run the classify stage first"
+        )
 
     result: dict = {
         "mode": config.mode,
+        "resumed": resuming,
         "steps": [],
+        "import": None,
         "surfaces": {"retained": retained, "dropped": sorted(config.drop_surfaces)},
         "groups": [],
         "same_medium": [],
@@ -187,11 +264,15 @@ def run(executor: Executor, config: WorkflowConfig, export_dir: str | Path) -> d
             raise WorkflowError(f"surfaces {missing} were not created by the import")
         return imported
 
-    def mesh_params(**extra) -> dict:
+    def mesh_params(reference: bool = False, **extra) -> dict:
+        element_size = config.element_size
+        if reference and config.reference_element_size is not None:
+            element_size = config.reference_element_size
         return {
-            "element_size": config.element_size,
+            "element_size": element_size,
             "element_type": config.element_type,
-            "mesh_type": config.mesh_type,
+            "density_mode": config.density_mode,
+            "mesh_algorithm": config.mesh_algorithm,
             "min_size": config.min_size,
             "max_size": config.max_size,
             "keep_existing_mesh": True,
@@ -199,25 +280,49 @@ def run(executor: Executor, config: WorkflowConfig, export_dir: str | Path) -> d
             **extra,
         }
 
-    # Both modes import into an empty model: imported entity IDs must be the
-    # IDs the caller's surface map names.  Fail loudly rather than let a
-    # non-empty model shift them.
-    summary = call("get_model_summary",
-                   {"entity_types": ["surface", "element"], "model_name": None})
-    counts = summary.get("counts", {})
-    existing_surfaces = int(counts.get("surface", 0) or 0)
-    existing_elements = int(counts.get("element", 0) or 0)
-    if existing_surfaces or existing_elements:
-        raise WorkflowError(
-            "step preflight: the model is not empty "
-            f"({existing_surfaces} surface(s), {existing_elements} element(s) present); "
-            "the workflow imports into an empty model - clear the model or start a "
-            "new HyperMesh session")
+    if resuming:
+        # A resumed run starts after the import and the reference pass.  The
+        # geometry is already there; only the reference elements must be gone.
+        imported = _resume_import(resume)
+        current["step"] = "preflight"
+        summary = call("get_model_summary",
+                       {"entity_types": ["surface", "element"], "model_name": None})
+        counts = summary.get("counts", {})
+        existing_elements = int(counts.get("element", 0) or 0)
+        if existing_elements:
+            raise WorkflowError(
+                "step preflight: a resumed run expects the reference mesh to be "
+                f"cleared, but {existing_elements} element(s) remain; clear the "
+                "reference mesh before producing")
+        existing = _surface_ids(call)
+        missing = [surface for surface in imported["surface_ids"]
+                   if surface not in existing]
+        if missing:
+            raise WorkflowError(
+                f"step preflight: imported surfaces {missing} are missing; "
+                "the model was changed or reloaded after classification")
+        components = _component_index(call)
+        result["import"] = imported
+    else:
+        # Both modes import into an empty model: imported entity IDs must be
+        # the IDs the caller's surface map names.  Fail loudly rather than let
+        # a non-empty model shift them.
+        summary = call("get_model_summary",
+                       {"entity_types": ["surface", "element"], "model_name": None})
+        counts = summary.get("counts", {})
+        existing_surfaces = int(counts.get("surface", 0) or 0)
+        existing_elements = int(counts.get("element", 0) or 0)
+        if existing_surfaces or existing_elements:
+            raise WorkflowError(
+                "step preflight: the model is not empty "
+                f"({existing_surfaces} surface(s), {existing_elements} element(s) present); "
+                "the workflow imports into an empty model - clear the model or start a "
+                "new HyperMesh session")
 
-    current["step"] = "import"
-    components = _component_index(call)
+        current["step"] = "import"
+        components = _component_index(call)
 
-    if config.mode == VERIFICATION:
+    if not resuming and config.mode == VERIFICATION:
         # Reference pass: every surface that carries a material, meshed on its
         # own, so each material's shell is complete.  Duplicates and surfaces
         # the operator will exclude stay in on purpose; removing them first
@@ -227,19 +332,24 @@ def run(executor: Executor, config: WorkflowConfig, export_dir: str | Path) -> d
         current["step"] = "import"
         reference_import = import_cad(shell_surfaces)
         imported = reference_import
+        result["import"] = imported
         if record("import", {"solids": reference_import.get("solid_ids", []),
                              "surfaces": reference_import.get("surface_ids", []),
                              "components": reference_import.get("component_ids", [])}):
             return result
 
         current["step"] = "reference_mesh"
+        # One surface per call, into the component named for that surface: the
+        # component is the explicit mesh-to-surface record.  The handler refuses
+        # a result that places created elements outside the requested component.
         reference_total = 0
         for surface in shell_surfaces:
             label = surface_label(surface, width)
             component_id = _ensure_component(call, components, label)
             outcome = call(
                 "automesh_surfaces",
-                mesh_params(surface_ids=[surface], component_id=component_id),
+                mesh_params(reference=True, surface_ids=[surface],
+                            component_id=component_id),
                 timeout=900,
             )
             if not outcome.get("element_count"):
@@ -318,9 +428,10 @@ def run(executor: Executor, config: WorkflowConfig, export_dir: str | Path) -> d
                                       "deleted_element_count": cleared.get("deleted_element_count"),
                                       "checkpoint": cleared.get("checkpoint")}):
             return result
-    else:
+    elif not resuming:
         current["step"] = "import"
         imported = import_cad(retained)
+        result["import"] = imported
         if record("import", {"solids": imported.get("solid_ids", []),
                              "surfaces": imported.get("surface_ids", []),
                              "components": imported.get("component_ids", [])}):
@@ -385,6 +496,10 @@ def run(executor: Executor, config: WorkflowConfig, export_dir: str | Path) -> d
         return result
 
     current["step"] = "mesh"
+    # One call for all surfaces keeps shared edges conformal.  HyperMesh records
+    # which elements came from which surface, but this module does not read that
+    # record back or verify it; the groups step selects through it.  See the
+    # module docstring for the verification required before claiming correctness.
     outcome = call(
         "automesh_surfaces",
         mesh_params(surface_ids=surfaces, component_id=None),
@@ -401,32 +516,40 @@ def run(executor: Executor, config: WorkflowConfig, export_dir: str | Path) -> d
     absent = [str(surface) for surface in surfaces if str(surface) not in pairs]
     if absent:
         raise WorkflowError(f"the pair table has no entry for surfaces {absent}")
-    if config.mode == GENERAL:
+    if config.mode == GENERAL or resuming:
         detail = {"source": "table", "table": str(table_path)}
         if record("pairs", detail):
             return result
 
     # 8. One component per boundary group, then move that group's elements in.
+    # The group name is decided from the surface's ordered material pair and
+    # face tags; the move selects elements by surface.  See the module
+    # docstring: the surface-to-element association is not verified here.
     current["step"] = "groups"
     buckets: dict[str, list[int]] = {}
     for surface in surfaces:
         entry = pairs[str(surface)]
         name = str(entry["pair"])
-        if entry.get("minus") is not None and entry.get("minus") == entry.get("plus"):
+        tags = entry.get("tags") or []
+        if (
+            entry.get("minus") is not None
+            and entry.get("minus") == entry.get("plus")
+            and not tags
+        ):
             result["same_medium"].append({"surface": surface, "pair": name})
             continue
         buckets.setdefault(name, []).append(surface)
     groups = []
-    for name, surfaces in sorted(buckets.items()):
+    for name, group_surfaces in sorted(buckets.items()):
         component_id = _ensure_component(call, components, name)
         moved = call(
             "organize_elements",
-            {"target_component_id": component_id, "surface_ids": surfaces,
+            {"target_component_id": component_id, "surface_ids": group_surfaces,
              "mode": "move", "model_name": None},
             timeout=1200,
         )
         groups.append({"name": name, "component_id": component_id,
-                       "surfaces": surfaces,
+                       "surfaces": group_surfaces,
                        "elements": moved.get("elements_in_target"),
                        "checkpoint": moved.get("checkpoint_file")})
     result["groups"] = groups
@@ -443,6 +566,25 @@ def run(executor: Executor, config: WorkflowConfig, export_dir: str | Path) -> d
     result["exports"]["pairs"] = str(table_path)
     record("export", {"output": str(output)})
     return result
+
+
+def _resume_import(resume: Mapping) -> dict:
+    """Normalize the import result carried by a resumed run."""
+    imported = resume.get("imported")
+    if not isinstance(imported, Mapping):
+        raise WorkflowError(
+            "resume.imported must be the import result from the classify stage"
+        )
+    surfaces = imported.get("surface_ids", imported.get("surfaces"))
+    if not surfaces:
+        raise WorkflowError("resume.imported must list at least one surface")
+    solids = imported.get("solid_ids", imported.get("solids", ()))
+    components = imported.get("component_ids", imported.get("components", ()))
+    return {
+        "surface_ids": [int(value) for value in surfaces],
+        "solid_ids": [int(value) for value in (solids or ())],
+        "component_ids": [int(value) for value in (components or ())],
+    }
 
 
 def _component_index(call: Callable[[str, dict], dict]) -> dict[str, int]:

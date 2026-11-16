@@ -1332,6 +1332,41 @@ class ExtensionHandlerTests(unittest.TestCase):
             self.assertEqual(solid_mesh["element_count"], 1)
             self.assertTrue(Path(block["checkpoint"]["checkpoint_file"]).is_file())
 
+    def test_surface_mesh_algorithm_and_density_are_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "allowed"
+            root.mkdir()
+            cad = root / "part.step"
+            cad.write_text("fake step", encoding="utf-8")
+            registry = HandlerRegistry([str(root)])
+            imported = registry.import_cad(str(cad))
+
+            result = registry.automesh_surfaces(
+                imported["surface_ids"],
+                element_size=2.0,
+                element_type="tria",
+                density_mode="curvature",
+                mesh_algorithm="free",
+            )
+            self.assertEqual(result["density_mode"], "curvature")
+            self.assertEqual(result["mesh_algorithm"], "free")
+            # Deprecated response alias still carries the density value.
+            self.assertEqual(result["mesh_type"], "curvature")
+
+            legacy = registry.automesh_surfaces(
+                imported["surface_ids"],
+                element_size=2.0,
+                mesh_type="curvature",
+            )
+            self.assertEqual(legacy["density_mode"], "curvature")
+
+            with self.assertRaisesRegex(ValueError, "Mapped"):
+                registry.automesh_surfaces(
+                    imported["surface_ids"],
+                    element_size=2.0,
+                    mesh_algorithm="mapped",
+                )
+
     def test_meshing_returns_a_bounded_element_id_sample(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "allowed"
@@ -1653,7 +1688,7 @@ class ExtensionHandlerTests(unittest.TestCase):
             )
 
         self.assertTrue(post["postprocessed"])
-        self.assertEqual(post["bridge_version"], "0.28.0")
+        self.assertEqual(post["bridge_version"], "0.29.0")
         self.assertEqual(post["legend"]["maximum"], 1.25)
         self.assertEqual(post["query"]["maximum_row"], [2, 1.25])
         self.assertEqual(post["query"]["minimum_row"], [1, 0.25])

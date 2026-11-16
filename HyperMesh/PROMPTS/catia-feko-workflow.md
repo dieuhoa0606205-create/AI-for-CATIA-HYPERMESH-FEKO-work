@@ -33,15 +33,20 @@
 | `face_tags` | 贴在面上、没有体积的边界条件，例如 `{"1": ["PEC"], "2": ["PEC"]}` |
 | `element_size` | 单元尺寸 |
 | `export_name` | 导出文件名，以 `.fhm` 结尾 |
-| `mode` | 首次运行用 `verification`，同一几何复跑用 `general` |
+| `mode` | 兼容保留；`classify` 阶段按验证语义执行，`produce` 阶段按复用语义执行 |
+
+网格算法与密度是两个不同的设置：`mesh_algorithm` 对应界面的 Mesh type（当前仅支持 `free`），`density_mode` 对应 Density（Proximity/Curvature）；`mesh_type` 是旧别名，不代表 Free/Mapped。
 
 ## 三、执行流程
 
-1. 首次运行调用 `run_catia_feko_workflow`，传入 `project_id`、`input_name`、`surface_materials`、`element_size`、`export_name`、`mode="verification"`、`drop_surfaces`、`face_tags`；其余参数保持默认，除非操作者另有要求。需要中途检查时可用 `stop_after` 指定步骤名，但不得跳步。
-2. 读取返回的 `steps`，逐步确认导入、删实体、去重、删面、缝合、划分、材料对判定、建组、搬单元、导出均成功。任何一步失败，按第五节处理。
-3. 核对材料对表：有序对的方向不得合并或改写；`same_medium` 中的面不进入分组；`undecided` 的面逐项列给操作者，不得替操作者选择。
-4. 核对分组清单与单元数：总单元数应等于划分步骤返回的 `element_count`。`element_ids` 可能因响应上限被抽样，数量一律以 `element_count` 为准。模型中的分组组件数应与返回的分组数一致。
-5. 确认首次运行结果完整后，才允许以 `mode="general"` 复跑。复跑前模型必须为空；不得在同一会话内重复导入同一 CAD 文件。
+1. 首先调用 `run_catia_feko_workflow`，`action="start"`，传入 `project_id`、`input_name`、`surface_materials`、`element_size`、`export_name`、`drop_surfaces`、`face_tags`；其余参数保持默认，除非操作者另有要求。返回 `status="decision_required"`，含材料对问题、理由、粗网格提示、两个选项与令牌。把问题原样交给操作者，不得替其选择。
+2. 操作者选择先判定材料属性时，以 `action="classify"` 和返回的 `token` 继续。该阶段导入 CAD、对全部带材料曲面逐面建立参考组件、导出参考网格、计算有序材料对、写配对表、删除参考组件并停在配对表确认。参考网格可用 `reference_element_size` 指定较粗尺寸，该尺寸不会进入最终网格。此阶段不去重、不删面。
+3. 核对材料对表：有序对的方向不得合并或改写；`same_medium` 中的面不进入分组；`undecided` 的面逐项列给操作者，不得替操作者选择。把配对表交给操作者确认。
+4. 操作者确认后，以 `action="produce"`、`confirm_pairs=true` 与同一 `token` 继续，完成删实体、去重、删面、缝合、划分、建组、搬单元与导出。该阶段不再次导入 CAD 文件。需要中途检查时可用 `stop_after` 指定步骤名，但不得跳步。
+5. 操作者选择跳过判定时，以 `action="skip"` 记录材料对未判定并停止。该阶段不导入、不改动模型；下一步任务由操作者指定，不得自行进入生产链。
+6. 读取返回的 `steps`，逐步确认各步成功。任何一步失败，按第五节处理。`action="status"` 可查询当前阶段；`start` 以输入参数为键，重复调用返回同一会话。
+7. 核对分组清单与单元数：总单元数应等于划分步骤返回的 `element_count`。`element_ids` 可能因响应上限被抽样，数量一律以 `element_count` 为准。模型中的分组组件数应与返回的分组数一致。核对每个面都有单元、各面单元数之和等于网格总单元数、且没有单元同时归属两个面。
+8. 确认一次完整运行结果后，才允许在同一几何上复跑。复跑前模型必须为空；不得在同一会话内重复导入同一 CAD 文件。
 
 ## 四、硬性规则
 
@@ -51,6 +56,8 @@
 - 不得为处理 `undecided` 面而拆分 CAD 曲面。FEKO 标签以三角形为单位，拆分会使几何与标签不一致；把清单交给操作者。
 - `surface_materials` 必须覆盖全部带材料曲面。漏面会使该材料的参考壳不闭合，材料对判定随之失真。
 - 只允许删除空组件。删除组件前确认其 `elements`、`surfaces`、`solids`、`lines`、`points` 均为空；不得为清理模型而删除仍有内容的组件。
+- 材料对判定完成前，`remove_live_duplicate_surfaces`、`delete_live_entities`（`surface`、`solid`）、`stitch_live_free_edges` 与 `trim_live_free_edges` 会返回 `decision_required` 而不执行。这是拦截，不是失败：把问题交给操作者，不得换用其他工具、拆分曲面或修剪自由边来绕过。
+- 经 `import_live_cad` 导入 CATIA 文件时，返回中会带 `material_pair_gate`。看到它就必须先处理材料对问题，不得直接去重、删面、缝合或修剪。操作者的答复用 `resolve_material_pair_decision` 记录；选择先判定时，在 `classify_material_pairs` 成功前拦截仍然有效。
 - 不修改用户设置，不绕过类型化工具，不实现或规避许可证机制。
 - 任一步失败时，读取错误信息与检查点路径，报告现象、已尝试操作与检查点位置。同类操作连续失败两次即停止，等待操作者决定，不更换途径反复尝试。
 

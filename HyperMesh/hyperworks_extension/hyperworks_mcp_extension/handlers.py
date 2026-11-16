@@ -34,7 +34,7 @@ def _tcl_quote(value: str) -> str:
     return '"%s"' % text
 
 
-BRIDGE_VERSION = "0.28.0"
+BRIDGE_VERSION = "0.29.0"
 MAX_NODES_PER_CALL = 5000
 MAX_ELEMENTS_PER_CALL = 5000
 MAX_ELEMENT_NODES = 20
@@ -71,12 +71,15 @@ SURFACE_ELEMENT_TYPES = {
     "right_tria": 3,
     "quad_only": 4,
 }
-SURFACE_MESH_TYPES = {
+SURFACE_DENSITY_MODES = {
     "proximity_curvature": 34,
     "curvature": 35,
     "proximity_curvature_free_edge": 36,
     "curvature_free_edge": 37,
 }
+# Deprecated alias.  These are Density/size-control modes, not the GUI
+# Mesh type (Free/Mapped); keep the name for older callers only.
+SURFACE_MESH_TYPES = SURFACE_DENSITY_MODES
 
 
 
@@ -4791,7 +4794,7 @@ class HandlerRegistry:
         surface_ids: list[int],
         element_size: float,
         element_type: str = "mixed",
-        mesh_type: str = "proximity_curvature",
+        density_mode: str = "proximity_curvature",
         min_size: float | None = None,
         max_size: float | None = None,
         chordal_deviation: float | None = None,
@@ -4800,6 +4803,8 @@ class HandlerRegistry:
         keep_existing_mesh: bool = True,
         component_id: int | None = None,
         model_name: str | None = None,
+        mesh_type: str | None = None,
+        mesh_algorithm: str = "free",
     ) -> dict[str, Any]:
         element_size = self._positive_float("element_size", element_size)
         min_size = self._positive_float("min_size", min_size or element_size * 0.2)
@@ -4819,8 +4824,34 @@ class HandlerRegistry:
             raise ValueError("growth_rate must be between 1 and 5")
         if element_type not in SURFACE_ELEMENT_TYPES:
             raise ValueError("Unsupported element_type")
-        if mesh_type not in SURFACE_MESH_TYPES:
-            raise ValueError("Unsupported mesh_type")
+        if mesh_type is not None:
+            if mesh_type in SURFACE_DENSITY_MODES:
+                if (
+                    density_mode != "proximity_curvature"
+                    and density_mode != mesh_type
+                ):
+                    raise ValueError(
+                        "density_mode and mesh_type disagree; use density_mode"
+                    )
+                density_mode = mesh_type
+            elif mesh_type in ("free", "mapped"):
+                if mesh_algorithm != "free" and mesh_algorithm != mesh_type:
+                    raise ValueError(
+                        "mesh_algorithm and mesh_type disagree; use mesh_algorithm"
+                    )
+                mesh_algorithm = mesh_type
+            else:
+                raise ValueError(
+                    "Unsupported mesh_type; use density_mode or mesh_algorithm"
+                )
+        if mesh_algorithm not in ("free", "mapped"):
+            raise ValueError("mesh_algorithm must be 'free' or 'mapped'")
+        if mesh_algorithm != "free":
+            raise ValueError(
+                "Mapped surface meshing is not implemented; use mesh_algorithm='free'"
+            )
+        if density_mode not in SURFACE_DENSITY_MODES:
+            raise ValueError("Unsupported density_mode")
 
         hm, ent = self._imports()
         model = self._model(model_name)
@@ -4852,7 +4883,7 @@ class HandlerRegistry:
                     comp_mode=0 if component is not None else 1,
                     size_control=1,
                     skew_control=1,
-                    mesh_type=SURFACE_MESH_TYPES[mesh_type],
+                    mesh_type=SURFACE_DENSITY_MODES[density_mode],
                     keep_mesh=1 if keep_existing_mesh else 0,
                     min_size=min_size,
                     max_size=max_size,
@@ -4888,7 +4919,9 @@ class HandlerRegistry:
             "element_count": len(created),
             "element_size": element_size,
             "element_type": element_type,
-            "mesh_type": mesh_type,
+            "density_mode": density_mode,
+            "mesh_algorithm": mesh_algorithm,
+            "mesh_type": density_mode,  # deprecated alias for density_mode
             "component": (
                 {"id": component_id, "name": str(component.name)}
                 if component is not None
