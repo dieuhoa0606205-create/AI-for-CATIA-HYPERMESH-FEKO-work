@@ -1,0 +1,156 @@
+# CATIA Agent MCP
+
+高级线框与曲面接口说明：
+[docs/advanced-surfaces.zh-CN.md](docs/advanced-surfaces.zh-CN.md)。
+
+防覆盖、临时文件验证和超时恢复：
+[docs/safe-export.zh-CN.md](docs/safe-export.zh-CN.md)。
+
+这是一个 Windows 本地 STDIO MCP Server，用于让 Codex/AI Agent 控制 CATIA V5 的原生建模和 CATIA 内部 Analysis/ELFINI 仿真。它不会调用 Abaqus、ANSYS、CalculiX 或其他第三方求解器。
+
+## 已实现范围
+
+- CATPart：草图、Pad、Pocket、恒定半径边倒圆、参数、材料、更新、保存、导出和模型树检查。
+- CATProduct：新建装配体、插入零部件和装配结构检查。
+- CATAnalysis：导入零件/装配、工况、Solution、Analysis Set、载荷/约束实体、支撑绑定、Mesh Part、网格规格、CATIA 内部计算、结果图像/数据和 HTML 报告。
+- 原生 GSD 线框/曲面：三维点、开闭 Spline、偏置平面、G0/G1/G2 Connect、
+  HybridShapeLoft 截面/引导线/耦合/闭合点、Join、Healing、Boundary、
+  Close Surface 和 Thick Surface。
+- 共 55 个固定、带类型的 MCP 工具。
+- 不开放任意 Python、CATScript、Shell 或任意 COM 方法执行。
+- CATIA COM 调用集中到单个 STA 工作线程，支持请求 ID 幂等、忙碌拒绝和文件根目录边界。
+
+本机验证目标是安装在 `G:\Program Files\Dassault Systemes\B33` 的 CATIA P3 V5-6R2023。代码会自动发现 CATEnv，不把这个安装位置写死在核心实现中。
+
+## 多版本策略
+
+- 目标基线：B28 / V5-6R2018 及以上。
+- 本机验证版本：B33 / V5-6R2023。
+- 更高版本继续保留完整工具面；服务器通过本机 TypeLib 和对象方法探测，只对实际缺失的操作做能力门控。
+- B28 以前的版本按最佳努力维护；V5R21/B21 已完成系统性适配与实机验证（见下），使用时显式设置 `CATIA_MCP_ALLOW_LEGACY=true`。
+- GPS/GAS/EST 等模块的 Analysis late type 不被压缩成最低版本公共子集；可通过通用但受控的 Set、Entity、Value、Support、Mesh、Image 接口使用当前版本已安装的高级能力。
+
+### V5R21（B21）兼容状态（实机验证）
+
+对 CATIA P3 V5R21 B21（SP6+HF5）完成了进一步适配：55 个工具全部实机探测，
+基础建模、边倒圆、GSD 曲面全链、材料、装配、BMP 截图、导出
+（stp/igs/stl/3dxml/cgr/model）以及 Analysis 全链（文档导入 → 工况 →
+`StaticSet` 解 → 约束/载荷 → Octree 网格 → 完整静态求解 → 变形网格图 →
+原生 HTML 报告）均已验证。V5R21 的行为差异已在代码中适配（fill 属性拒绝、
+join 角度模式降级、被引用零件关闭验证、mesh/entity 支撑引用、报告 Folder
+对象等），详见
+[docs/compatibility-and-architecture.md](docs/compatibility-and-architecture.md)
+的 "Legacy release notes" 章节。
+
+- 复现能力探测：`python .\scripts\probe_release_capabilities.py`
+- 复现分析全链：`python .\scripts\validate_analysis_chain.py`
+
+安装目录中存在 DLL 或 TypeLib 不等于 GPS/GAS/EST 许可证可用。第一次真实许可证检查是创建并导入 `CATAnalysis` 文档。
+
+## 启动和配置
+
+当前机器可直接使用：
+
+```powershell
+& '.\scripts\run_server.ps1'
+```
+
+Codex 配置示例位于 [examples/codex_config.example.toml](examples/codex_config.example.toml)。安装其他 CATIA 版本时，将 `CATIA_MCP_ENV_NAME` 改为对应 CATEnv 文件名即可，例如：
+
+```toml
+CATIA_MCP_ENV_NAME = "CATIA_P3.V5-6R2023.B33"
+CATIA_MCP_MIN_RELEASE_INDEX = "28"
+```
+
+服务器兼容 MCP SDK 1.x 和 2.x（`mcp>=1.7,<3`）：SDK 2.x 使用公开的
+`MCPServer` API，仅在 SDK 1.x 下回退到旧版 `FastMCP` 导入。
+
+CATIA 与 MCP 必须在相同 Windows 用户和相同权限级别下运行。如果一个以管理员权限启动、另一个不是，可能看得到 `CNEXT.exe`，却无法从 ROT 取得 `CATIA.Application`。
+
+## 工具分组
+
+建模与会话：
+
+- `catia_health_check`、`catia_connect`、`catia_list_documents`
+- `catia_create_part`、`catia_create_product`
+- `catia_create_sketch`、`catia_add_pad`、`catia_add_pocket`
+- `catia_inspect_edges`、`catia_add_edge_fillet`
+- `catia_create_parametric_part`、`catia_add_components`
+- `catia_list_materials`、`catia_apply_material`
+- `catia_list_parameters`、`catia_set_parameter`
+- `catia_update_active`、`catia_inspect_active`
+- `catia_save_active`、`catia_export_active`、`catia_capture_view`
+
+`catia_export_active` 默认 `overwrite_policy="error"`。目标已存在时不会进入
+CATIA，也不会弹出覆盖窗口。需要保留版本时使用 `versioned`；需要替换时使用
+`replace`，工具会先导出并回读验证唯一临时文件，再执行文件系统替换。
+
+`catia_add_pocket` 新增向后兼容的 `reverse=false` 参数。原点平面草图需要朝
+草图法向另一侧的材料切除时，设置 `reverse=true`。返回结果会给出切除方向、
+以 mm^3 表示的切除前后体积、`removed_volume_mm3` 和 `material_removed`；体积没有下降时返回
+`status="no_material_removed"` 和警告，不再把无效切除伪装成已验证成功。
+
+`catia_capture_view` 继续只接受 BMP，以保持 CATIA V5 Automation 的稳定兼容。
+工具使用 `catCaptureFormatBMP`（数值 `4`），并在返回 `is_image=true` 前检查
+文件头必须为 `BM`；CATIA 静默生成非图片内容时会返回错误。
+
+### 恒定半径边倒圆
+
+执行倒圆前先调用 `catia_inspect_edges`。工具搜索 `body_name` 的当前三维实体拓扑
+并排除草图线，也可以限定到可选的具名 `source_feature_name`。它返回从 1 开始的
+索引、CATIA 引用显示名和可读取的 SPA 测量值。这些索引只是当前拓扑快照，不是
+永久拓扑 ID；任何上游几何变化后都必须重新检查。
+
+`catia_add_edge_fillet` 使用 `radius_mm`、一个或多个 `edge_indices`，以及
+`propagation="minimal"` 或 `"tangency"` 创建原生 Part Design
+`ConstRadEdgeFillet`。多边输入保持调用顺序，因为选择顺序可能影响 CATIA 的原生
+求解结果。返回值会回读半径、传播模式、`ObjectsToFillet` 数量和倒圆前后实体
+体积；仅有 COM 更新成功不会被表述为完整几何质量证明。
+
+0.3.0 版本暂不开放变半径、面、三切线或曲面倒圆，也不包含倒角工具。
+
+CATIA 已运行时，可执行 `python .\scripts\validate_issue_fixes.py`，创建隔离测试
+零件并同时验证反向 Pocket 的方向/体积和 BMP 文件头。产物写入 `workspace`，
+脚本不会关闭用户已有文档。
+
+CATIA 内部仿真：
+
+- `catia_analysis_catalog`
+- `catia_create_analysis_document`、`catia_inspect_analysis`
+- `catia_add_analysis_case`、`catia_add_analysis_solution`
+- `catia_run_analysis_transition`（保留高级模块的原生 Transition）
+- `catia_add_analysis_set`、`catia_add_analysis_entity`
+- `catia_set_analysis_entity_value`、`catia_bind_analysis_support`
+- `catia_add_analysis_mesh_part`
+- `catia_set_analysis_mesh_specification`、`catia_bind_analysis_mesh_support`
+- `catia_compute_analysis`
+- `catia_create_analysis_result_image`
+- `catia_export_analysis_result_data`
+- `catia_build_analysis_report`
+
+## 推荐操作顺序
+
+1. 调用 `catia_health_check`，确认选中的版本和 Analysis TypeLib。
+2. 调用 `catia_connect`；默认只连接，不擅自启动新实例。
+3. 使用小粒度原生特征建模，每个关键步骤后检查模型树。
+4. 先分配具有力学属性的 CATIA 材料，再创建 CATAnalysis。
+5. 导入零件/装配后检查 Model、Case、Set 和 Mesh Part。
+6. 创建约束、载荷、网格与支撑，随后先执行 `mesh_only=true`。
+7. 检查网格后再执行完整计算。
+8. 创建结果图像、导出数值数据并生成 CATIA 原生报告。
+
+`Compute` 返回只说明 CATIA 的 COM 调用已经返回，不代表物理模型正确。必须继续检查材料、单位、边界条件、网格、结果图像、位移/应力数据和报告。
+
+## 本地验证命令
+
+```powershell
+$env:PYTHONPATH=(Resolve-Path '.\src').Path
+python -m unittest discover -s '.\tests' -v
+python -m compileall -q '.\src'
+python '.\scripts\stdio_smoke.py'
+python '.\scripts\probe_environment.py'
+python '.\scripts\probe_live.py'
+python '.\scripts\validate_edge_fillet.py'
+```
+
+详细兼容性和架构说明见 [docs/compatibility-and-architecture.md](docs/compatibility-and-architecture.md)。

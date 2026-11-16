@@ -1,0 +1,76 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+*.egg-info/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.local
+
+# Runtime and generated content
+.tmp/
+tmp/
+outputs/
+exports/
+work/
+artifacts/
+*.log
+*.pid
+
+# CAD and visualization outputs
+*.CATPart
+*.CATProduct
+*.CATAnalysis
+*.SLDPRT
+*.SLDASM
+*.SLDDRW
+*.f3d
+*.step
+*.stp
+*.iges
+*.igs
+*.stl
+*.glb
+*.bmp
+
+# MCP workspaces: keep only placeholders
+**/workspace/*
+!**/workspace/.gitkeep
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# EPLAN private inputs and native build products
+MCP/EPLAN/private/
+MCP/EPLAN/build/
+MCP/EPLAN/**/bin/
+MCP/EPLAN/**/obj/
+MCP/EPLAN/**/*.dll
+MCP/EPLAN/**/*.pdb
+MCP/EPLAN/**/*.elk
+MCP/EPLAN/**/*.edb/
+MCP/EPLAN/**/*.zw1
+MCP/EPLAN/**/*.sqlite3
+
+# Native CAD/customer files remain local
+*.sldprt
+*.sldasm
+*.slddrw
+*.SLDPRT
+*.SLDASM
+*.SLDDRW
+*.step
+*.stp
+*.sqlite3

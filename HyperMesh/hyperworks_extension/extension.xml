@@ -1,0 +1,11 @@
+<section name="Extension">
+    <entry name="name" value="HyperWorks MCP Bridge" />
+    <entry name="displayName" value="HyperWorks MCP Bridge" />
+    <entry name="minProductVersion" value="2025" />
+    <entry name="version" value="0.25.0" />
+    <entry name="author" value="CAE-Agent-Hub" />
+    <entry name="description" value="Authenticated localhost bridge for controlled HyperMesh preprocessing and HyperView result postprocessing." />
+    <entry name="supportedClient" value="HyperWorksDesktop" />
+    <entry name="script" value="load.py" />
+    <entry name="unloadScript" value="unload.py" />
+</section>

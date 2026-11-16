@@ -1,0 +1,124 @@
+# CATIA Agent MCP
+
+A Windows STDIO MCP server for AI-agent control of CATIA V5 modeling and native CATIA Analysis/ELFINI simulation. It does not invoke Abaqus, ANSYS, CalculiX, or another third-party solver.
+
+Chinese documentation: [README.zh-CN.md](README.zh-CN.md)
+
+Safe overwrite, temporary validation and timeout recovery:
+[docs/safe-export.md](docs/safe-export.md).
+
+## Current scope
+
+- Native CATPart sketch, pad, pocket, constant-radius edge fillet, parameters, materials, update, save, export and inspection.
+- Native GSD wireframe/surface creation: 3D points, closed/open splines, offset planes,
+  G0/G1/G2 connect curves, HybridShapeLoft sections/guides/coupling/closing points,
+  Join, Healing, Boundary, Close Surface and Thick Surface.
+- Native CATProduct creation and component insertion.
+- Native CATAnalysis creation/import, cases, solutions, sets, entities, supports, mesh parts, mesh specifications, internal compute, result images/data and HTML reports.
+- 55 fixed, typed MCP tools. Arbitrary Python, CATScript, shell and raw COM execution are intentionally not exposed.
+- Dedicated STA worker, serialized COM calls, request-id idempotency and bounded filesystem roots.
+
+The local validation target is CATIA P3 V5-6R2023 B33 at `G:\Program Files\Dassault Systemes\B33`. The implementation discovers installed V5 environments instead of hard-coding that location.
+
+## Version policy
+
+- Targeted baseline: B28 / V5-6R2018 and newer.
+- Locally validated target: B33 / V5-6R2023.
+- Newer releases keep the complete MCP tool surface. Runtime type-library and object-method probes gate only the missing operation.
+- Releases older than B28 are maintained on a best-effort basis; V5R21/B21 is adapted and live-validated (see below) and still requires `CATIA_MCP_ALLOW_LEGACY=true`.
+- Module-specific Analysis late types are passed through screened Analysis methods, so GPS/GAS/EST features do not get reduced to a lowest-common-denominator schema.
+
+### V5R21 (B21) compatibility status (live-validated)
+
+CATIA P3 V5R21 B21 (SP6+HF5) has been adapted and validated end to end: all 55
+tools were probed live, and basic modeling, the edge-fillet chain, the complete
+GSD surface chain, materials, assembly, BMP capture, exports
+(stp/igs/stl/3dxml/cgr/model) and the complete Analysis chain (document import
+-> cases -> `StaticSet` solutions -> restraints/loads -> Octree mesh -> full
+static compute -> deformed-mesh image -> native HTML report) all pass.
+Release-specific behaviour differences (fill property rejection, join
+angular-mode fallback, referenced-part close verification, mesh/entity support
+references, report Folder object) are adapted in code; see the "Legacy release
+notes" section of
+[docs/compatibility-and-architecture.md](docs/compatibility-and-architecture.md).
+
+- Re-probe capabilities: `python .\scripts\probe_release_capabilities.py`
+- Re-run the analysis chain: `python .\scripts\validate_analysis_chain.py`
+
+Installed DLLs do not prove that a workbench licence is available. `catia_create_analysis_document` is the first live licence test.
+
+## Start
+
+The checked startup wrapper selects `CATIA_MCP_PYTHON`, a local `.venv`, or the available Codex Python runtime without writing logs to STDIO:
+
+```powershell
+& '.\scripts\run_server.ps1'
+```
+
+Copy [examples/codex_config.example.toml](examples/codex_config.example.toml) into the appropriate Codex config. Adjust `CATIA_MCP_ENV_NAME` for another installed release.
+
+The server supports MCP SDK 1.x and 2.x (`mcp>=1.7,<3`). It uses the public
+`MCPServer` API on SDK 2.x and retains the legacy `FastMCP` import only for SDK 1.x.
+
+CATIA and the MCP process must run as the same Windows user and at the same integrity/elevation level. Otherwise the process can see `CNEXT.exe` while `CATIA.Application` remains unavailable through the Running Object Table.
+
+## Validation
+
+```powershell
+$env:PYTHONPATH=(Resolve-Path '.\src').Path
+python -m unittest discover -s '.\tests' -v
+python -m compileall -q '.\src'
+python '.\scripts\stdio_smoke.py'
+python '.\scripts\probe_environment.py'
+python '.\scripts\probe_live.py'
+python '.\scripts\validate_issue_fixes.py'
+python '.\scripts\validate_edge_fillet.py'
+```
+
+Use `probe_live.py --start-if-missing` only when starting the selected CATIA environment is intended.
+
+## Safe operating sequence
+
+1. `catia_health_check`
+2. `catia_connect`
+3. Build in small native steps and call `catia_inspect_active` after updates.
+4. Save only under `CATIA_MCP_ALLOWED_ROOTS`.
+5. Export with the default `overwrite_policy="error"`. Use `versioned` or
+   `replace` only when explicitly intended; exports are staged through a unique
+   temporary file and STEP/IGES is re-imported by default.
+6. For simulation, inspect the imported Analysis tree before creating loads, restraints or mesh definitions.
+7. After `catia_compute_analysis`, verify mesh parts, result images, exported numerical data and the native report. A returned COM call alone is not proof of correct physics.
+
+See [docs/advanced-surfaces.md](docs/advanced-surfaces.md) for the GSD tool contracts and
+[docs/compatibility-and-architecture.md](docs/compatibility-and-architecture.md) for the capability model and limitations.
+
+## Pocket direction and capture validation
+
+`catia_add_pocket` accepts `reverse=false` by default. Set `reverse=true` when an
+origin-plane sketch must cut toward material on the opposite side of the sketch
+normal. The result reports the direction orientation, body volume before/after in
+mm^3, `removed_volume_mm3`, and `material_removed`. A zero-volume change is returned as
+`status="no_material_removed"` with a warning instead of looking like a verified cut.
+
+`catia_capture_view` intentionally remains BMP-only for stable CATIA V5 Automation
+compatibility. It uses `catCaptureFormatBMP` (numeric value `4`) and verifies the
+`BM` file signature before returning `is_image=true`; a non-image payload is an error.
+
+## Constant-radius edge fillet
+
+Call `catia_inspect_edges` immediately before filleting. It searches the current
+three-dimensional solid topology of `body_name`, filtering out sketch-wire edges, or
+it can scope the search to an optional named `source_feature_name`. It returns
+one-based indices, CATIA reference display names and available SPA measurements.
+Those indices are a snapshot, not persistent topology identifiers; reacquire them
+after any upstream geometry change.
+
+`catia_add_edge_fillet` creates a native Part Design `ConstRadEdgeFillet` with
+`radius_mm`, one or more inspected `edge_indices`, and `propagation="minimal"` or
+`"tangency"`. Input order is preserved because multi-edge fillet order can affect the
+native result. The response reads back the radius, propagation, `ObjectsToFillet`
+count and body volume before/after; an update-only result is not represented as full
+geometric-quality proof.
+
+Version 0.3.0 does not expose variable-radius, face, tritangent or surface fillets,
+and it does not add chamfer support.
