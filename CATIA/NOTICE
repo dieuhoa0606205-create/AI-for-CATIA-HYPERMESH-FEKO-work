@@ -1,19 +1,19 @@
-本仓库基于 Cai-aa/CAD-Agent-Hub 修改而来。
+本仓库基于 Cai-aa/CAD-Agent-Hub 修改而来，并按 MIT 许可证公开发布。
 
 原始项目：https://github.com/Cai-aa/CAD-Agent-Hub
 原始版权：Copyright (c) 2026 Cai-aa
 
-本仓库包含对原始项目的修改与功能补丁，修改内容见提交记录。未经作者许可，本仓库不对外发布，仅供授权使用者内部使用。
+本仓库包含对原始项目的修改与功能补丁，修改内容见提交记录。
 
 许可证：本项目沿用 MIT 许可证，全文见 LICENSE 文件。原始版权声明与许可声明必须保留在所有副本或实质性部分中。再分发本项目或基于本项目的衍生作品时，须同时保留 LICENSE 与本说明文件。
 
 ---
 
-This repository is a modified version of Cai-aa/CAD-Agent-Hub.
+This repository is a modified version of Cai-aa/CAD-Agent-Hub and is released publicly under the MIT License.
 
 Original project: https://github.com/Cai-aa/CAD-Agent-Hub
 Original copyright: Copyright (c) 2026 Cai-aa
 
-This repository contains modifications and patches to the original project; see the commit history for details. It is not publicly released and is intended for authorized internal use only.
+This repository contains modifications and patches to the original project; see the commit history for details.
 
 License: This project is distributed under the MIT License; see LICENSE for the full text. The original copyright notice and this permission notice shall be included in all copies or substantial portions of the Software. Redistributions and derivative works must retain both LICENSE and this NOTICE.

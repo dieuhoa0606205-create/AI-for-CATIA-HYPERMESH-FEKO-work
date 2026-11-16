@@ -56,5 +56,9 @@ CATIA → HyperMesh → FEKO 分组网格使用 `run_catia_feko_workflow`。首�
 
 | 文档 | 用途 |
 |---|---|
-| [HyperMesh/README.zh-CN.md](HyperMesh/README.zh-CN.md) | 安装、工具范围与实时流程 |
+| [HyperMesh/README.zh-CN.md](HyperMesh/README.zh-CN.md) | 安装、工具范围、工作流、测试与限制 |
+| [HyperMesh/tests/README.md](HyperMesh/tests/README.md) | 测试文件分工与免许可证测试命令 |
+| [CATIA/MCP/CATIA/tests/README.md](CATIA/MCP/CATIA/tests/README.md) | CATIA 测试文件分工 |
 | [CHANGELOG.md](CHANGELOG.md) | 阶段变更与版本记录 |
+
+README 只保留入口与操作要点。版本历史、已完成的逐项修改与旧版本细节写入 CHANGELOG，避免在 README 中重复。
